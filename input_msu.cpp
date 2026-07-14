@@ -51,7 +51,10 @@ void input_msu::open(service_ptr_t<file> p_filehint, const char* p_path,
     if (::memcmp(header, MSU_MAGIC, 4) != 0)
         throw exception_io_unsupported_format();
 
-    m_loopStartSample = header[4] | (header[5] << 8) | (header[6] << 16) | (header[7] << 24);
+    m_loopStartSample = (uint32_t)header[4]
+                      | ((uint32_t)header[5] << 8)
+                      | ((uint32_t)header[6] << 16)
+                      | ((uint32_t)header[7] << 24);
     m_loopStartByte   = HEADER_SIZE + (uint64_t)m_loopStartSample * BYTES_PER_SAMPLE;
 
     // A loop point past or at EOF means no looping
@@ -73,7 +76,7 @@ void input_msu::get_info(file_info& p_info, abort_callback& p_abort)
     const char* path = m_path;
     const char* sep  = strrchr(path, '\\');
     const char* fwd  = strrchr(path, '/');
-    if (fwd > sep) sep = fwd;
+    if (!sep || (fwd && fwd > sep)) sep = fwd;
     const char* fname = sep ? sep + 1 : path;
 
     const char* dash = strrchr(fname, '-');
