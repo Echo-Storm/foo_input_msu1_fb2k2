@@ -1,144 +1,257 @@
 #include "stdafx.h"
-#include <exception>
+#include "advconfig_impl.h"
 #include "input_msu.h"
+#include <algorithm>
 
 #define MSU_MAGIC "MSU1"
 
-// larger values cause seeking distortion [ms]
-static const uint32_t BUFFER_DURATION = 100;
+// GUIDs for Advanced Preferences entries
+static const GUID guid_cfg_loop_count =
+    { 0xc1a2b3c4, 0xd5e6, 0xf7a8, { 0xb9, 0xc0, 0xd1, 0xe2, 0xf3, 0xa4, 0xb5, 0xc6 } };
+static const GUID guid_cfg_fade_secs =
+    { 0xe1f2a3b4, 0xc5d6, 0xe7f8, { 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6 } };
+
+// 0 = infinite loop (no fade), 1+ = loop N times then fade out
+static advconfig_integer_factory_cached cfg_loop_count(
+    "MSU-1 PCM: Loop count (0 = infinite)",
+    "msu1_loop_count",
+    guid_cfg_loop_count,
+    advconfig_entry::guid_branch_decoding,
+    0.0, 2, 0, 100);
+
+// Fade duration in seconds (only used when loop count > 0)
+static advconfig_integer_factory_cached cfg_fade_secs(
+    "MSU-1 PCM: Fade-out duration (seconds)",
+    "msu1_fade_secs",
+    guid_cfg_fade_secs,
+    advconfig_entry::guid_branch_decoding,
+    1.0, 8, 1, 60);
+
 
 input_msu::input_msu()
+    : m_fileSize(0), m_loopStartSample(0), m_loopStartByte(0), m_hasLoop(false),
+      m_currentByte(0), m_loopsRemaining(0),
+      m_fading(false), m_fadeBytesRead(0), m_done(false)
+{}
+
+void input_msu::open(service_ptr_t<file> p_filehint, const char* p_path,
+                     t_input_open_reason p_reason, abort_callback& p_abort)
 {
-	m_PcmFilePos = 0;
-	m_PcmFileLoop = 0;
-	m_PcmFileLength = 0;
+    m_file = p_filehint;
+    m_path = p_path;
+    input_open_file_helper(m_file, p_path, p_reason, p_abort);
+
+    m_fileSize = m_file->get_size(p_abort);
+    if (m_fileSize < HEADER_SIZE)
+        throw exception_io_unsupported_format();
+
+    uint8_t header[HEADER_SIZE];
+    m_file->read(header, HEADER_SIZE, p_abort);
+
+    if (::memcmp(header, MSU_MAGIC, 4) != 0)
+        throw exception_io_unsupported_format();
+
+    m_loopStartSample = header[4] | (header[5] << 8) | (header[6] << 16) | (header[7] << 24);
+    m_loopStartByte   = HEADER_SIZE + (uint64_t)m_loopStartSample * BYTES_PER_SAMPLE;
+
+    // A loop point past or at EOF means no looping
+    m_hasLoop = (m_loopStartByte < m_fileSize);
 }
 
-input_msu::~input_msu()
+void input_msu::get_info(file_info& p_info, abort_callback& p_abort)
 {
-	
+    p_info.set_length(totalSecs());
+    p_info.info_set_int("samplerate",    SAMPLE_RATE);
+    p_info.info_set_int("channels",      2);
+    p_info.info_set_int("bitspersample", 16);
+    p_info.info_set("codec", "MSU-1 PCM");
+    if (m_hasLoop) {
+        p_info.info_set_int("loop_start", m_loopStartSample);
+    }
+
+    // Extract track number from the filename (e.g., "chrono_msu-2.pcm" -> "2")
+    const char* path = m_path;
+    const char* sep  = strrchr(path, '\\');
+    const char* fwd  = strrchr(path, '/');
+    if (fwd > sep) sep = fwd;
+    const char* fname = sep ? sep + 1 : path;
+
+    const char* dash = strrchr(fname, '-');
+    const char* dot  = strrchr(fname, '.');
+    if (dash && dot && dot > dash + 1) {
+        pfc::string8 trackNum;
+        trackNum.set_string(dash + 1, (t_size)(dot - dash - 1));
+        p_info.meta_set("tracknumber", trackNum);
+    }
 }
 
-/**
-* Open file
-*
-* @param p_filehint
-* @param p_path
-* @param p_reason
-* @param p_abort
-*
-*/
-void input_msu::open(service_ptr_t<file> p_filehint, const char *p_path, t_input_open_reason p_reason, abort_callback &p_abort)
+void input_msu::decode_initialize(unsigned /*p_flags*/, abort_callback& p_abort)
 {
-	m_File = p_filehint;
-	m_PcmPath.set_string(p_path);
-	input_open_file_helper(m_File, p_path, p_reason, p_abort);
+    m_file->seek(HEADER_SIZE, p_abort);
+    m_currentByte = HEADER_SIZE;
 
-	// read spc file
-	m_PcmFileLength = static_cast<uint32_t>(m_File->get_size(p_abort));
-	m_PcmFile.set_size(m_PcmFileLength);
-	m_File->read(m_PcmFile.get_ptr(), m_PcmFileLength, p_abort);
+    uint64_t count = cfg_loop_count.get();
+    m_loopsRemaining = (count == 0) ? -1 : (int)count;
 
-	// check header
-	if (::memcmp(m_PcmFile.get_ptr(), MSU_MAGIC, 4)) {
-		throw exception_io_unsupported_format();
-	}
+    m_fading       = false;
+    m_fadeBytesRead = 0;
+    m_done         = false;
 }
 
-/**
-* Get track info
-*
-* @param p_info
-* @param p_abort
-*
-*/
-void input_msu::get_info(file_info &p_info, abort_callback &p_abort)
+bool input_msu::handle_loop_end(abort_callback& p_abort)
 {
-	p_info.set_length((m_PcmFileLength - 8.0) / (44100.0 * 4.0));
-	
-	p_info.info_set_int("samplerate", 44100);
-	p_info.info_set_int("channels", 2);
-	p_info.info_set_int("bitspersample", 16);
-
-	std::string p = m_PcmPath.toString();
-	std::string t = p.substr(p.find_last_of("-") + 1, p.find_last_of(".") - p.find_last_of("-") - 1);
-	p_info.meta_add("tracknumber", t.c_str());
+    if (!m_hasLoop) {
+        m_done = true;
+        return false;
+    }
+    if (m_fading) {
+        // Hit EOF while fading; wrap to keep fade going
+        m_file->seek(m_loopStartByte, p_abort);
+        m_currentByte = m_loopStartByte;
+        return true;
+    }
+    if (m_loopsRemaining < 0) {
+        // Infinite: just loop forever
+        m_file->seek(m_loopStartByte, p_abort);
+        m_currentByte = m_loopStartByte;
+        return true;
+    }
+    // Finite: count down
+    m_loopsRemaining--;
+    if (m_loopsRemaining == 0) {
+        m_fading        = true;
+        m_fadeBytesRead = 0;
+    }
+    m_file->seek(m_loopStartByte, p_abort);
+    m_currentByte = m_loopStartByte;
+    return true;
 }
 
-/**
-* Initialize for decode
-*
-* @param p_flags
-* @param p_abort
-*
-*/
-void input_msu::decode_initialize(unsigned int p_flags, abort_callback &p_abort)
+bool input_msu::decode_run(audio_chunk& p_chunk, abort_callback& p_abort)
 {
-	m_PcmFilePos = 8;
-	m_PcmFileLoop = (*((uint32_t *)(m_PcmFile.get_ptr() + 4)) * 4) + 8;
+    if (m_done) return false;
+
+    uint64_t bytesLeft = m_fileSize - m_currentByte;
+    if (bytesLeft == 0) {
+        if (!handle_loop_end(p_abort)) return false;
+        bytesLeft = m_fileSize - m_currentByte;
+        if (bytesLeft == 0) return false;
+    }
+
+    uint32_t toRead = (uint32_t)std::min<uint64_t>(
+        (uint64_t)CHUNK_SAMPLES * BYTES_PER_SAMPLE, bytesLeft);
+
+    int16_t buf[CHUNK_SAMPLES * 2];
+    m_file->read(buf, toRead, p_abort);
+    m_currentByte += toRead;
+
+    uint32_t numSamples = toRead / BYTES_PER_SAMPLE;
+
+    if (m_fading) {
+        uint64_t fadeTotalBytes = (uint64_t)cfg_fade_secs.get() * SAMPLE_RATE * BYTES_PER_SAMPLE;
+        uint32_t numChannelSamples = numSamples * 2; // stereo interleaved shorts
+        for (uint32_t i = 0; i < numChannelSamples; i++) {
+            uint64_t sampleFadePos = m_fadeBytesRead + (i / 2) * (uint64_t)BYTES_PER_SAMPLE;
+            if (sampleFadePos >= fadeTotalBytes) {
+                buf[i] = 0;
+            } else {
+                float vol = 1.0f - (float)sampleFadePos / (float)fadeTotalBytes;
+                buf[i] = (int16_t)((float)buf[i] * vol);
+            }
+        }
+        m_fadeBytesRead += toRead;
+        if (m_fadeBytesRead >= fadeTotalBytes) {
+            m_done = true;
+        }
+    }
+
+    p_chunk.set_data_int16(buf, numSamples, 2, SAMPLE_RATE,
+                           audio_chunk::channel_config_stereo);
+    return !m_done;
 }
 
-/**
-* Decode
-*
-* @param p_chunk
-* @param p_abort
-* @return true / false
-*/
-bool input_msu::decode_run(audio_chunk &p_chunk, abort_callback &p_abort)
+void input_msu::decode_seek(double p_seconds, abort_callback& p_abort)
 {
-	uint32_t wanted_ms = BUFFER_DURATION;
-	int16_t buf[44100 * BUFFER_DURATION * 4 / 1000];
+    m_done         = false;
+    m_fading       = false;
+    m_fadeBytesRead = 0;
 
-	if (m_PcmFilePos >= m_PcmFileLength)
-	{
-		if (m_PcmFileLoop < m_PcmFileLength)
-		{
-			m_PcmFilePos = m_PcmFileLoop;
-		}
-		else
-		{
-			return false;
-		}
-	}
+    uint64_t cfgCount = cfg_loop_count.get();
+    int loopTotal = (cfgCount == 0) ? -1 : (int)cfgCount;
 
-	uint32_t buffer_size = m_PcmFilePos + sizeof(buf) < m_PcmFileLength ? sizeof(buf) : m_PcmFileLength - m_PcmFilePos;
+    if (!m_hasLoop) {
+        uint64_t byteOff = HEADER_SIZE + (uint64_t)(p_seconds * SAMPLE_RATE * BYTES_PER_SAMPLE);
+        m_currentByte    = std::min(byteOff, m_fileSize);
+        m_loopsRemaining = 0;
+    } else {
+        uint64_t loopBytes = m_fileSize - m_loopStartByte;
+        uint64_t targetByte = HEADER_SIZE + (uint64_t)(p_seconds * SAMPLE_RATE * BYTES_PER_SAMPLE);
 
-	//memcpy(buf, m_PcmFile.get_ptr() + m_PcmFilePos, buffer_size);
+        if (targetByte <= m_loopStartByte || loopBytes == 0) {
+            m_currentByte    = std::min(targetByte, m_loopStartByte);
+            m_loopsRemaining = loopTotal;
+        } else {
+            uint64_t pastIntro    = targetByte - m_loopStartByte;
+            uint64_t whichLoop    = pastIntro / loopBytes;
+            uint64_t offsetInLoop = pastIntro % loopBytes;
+            m_currentByte = m_loopStartByte + offsetInLoop;
 
-	if (buffer_size < sizeof(buf))
-	{
-		buffer_size -= 0;
-	}
+            if (loopTotal < 0) {
+                m_loopsRemaining = -1;
+            } else {
+                int loopsLeft = loopTotal - (int)whichLoop;
+                if (loopsLeft <= 0) {
+                    m_fading = true;
+                    uint64_t fadeTotalBytes = (uint64_t)cfg_fade_secs.get() * SAMPLE_RATE * BYTES_PER_SAMPLE;
+                    uint64_t inFade = pastIntro - (uint64_t)loopTotal * loopBytes;
+                    m_fadeBytesRead = std::min(inFade, fadeTotalBytes);
+                    m_loopsRemaining = 0;
+                    if (m_fadeBytesRead >= fadeTotalBytes)
+                        m_done = true;
+                } else {
+                    m_loopsRemaining = loopsLeft;
+                }
+            }
+        }
+    }
 
-	p_chunk.set_data_int16(reinterpret_cast<int16_t *>(m_PcmFile.get_ptr() + m_PcmFilePos), buffer_size / 4, 2, 44100, audio_chunk::channel_config_stereo);
-
-	m_PcmFilePos += buffer_size;
-
-	return true;
+    if (!m_done)
+        m_file->seek(m_currentByte, p_abort);
 }
 
-/**
-* Seek
-*
-* @param p_seconds
-* @param p_abort
-*/
-void input_msu::decode_seek(double p_seconds, abort_callback &p_abort)
+double input_msu::introSecs() const
 {
-	// compare desired seek pos with current pos
-	uint32_t NewPos = static_cast<uint32_t>(p_seconds * 4 * 44100) & ~0x0007;
-
-	m_PcmFilePos = NewPos + 8 <= m_PcmFileLength ? NewPos + 8 : m_PcmFileLength;
+    return (double)(m_loopStartByte - HEADER_SIZE) / (SAMPLE_RATE * BYTES_PER_SAMPLE);
 }
+
+double input_msu::loopSecs() const
+{
+    return (double)(m_fileSize - m_loopStartByte) / (SAMPLE_RATE * BYTES_PER_SAMPLE);
+}
+
+double input_msu::totalSecs() const
+{
+    if (!m_hasLoop)
+        return (double)(m_fileSize - HEADER_SIZE) / (SAMPLE_RATE * BYTES_PER_SAMPLE);
+
+    uint64_t cfgCount = cfg_loop_count.get();
+    if (cfgCount == 0)
+        return introSecs() + 2.0 * loopSecs(); // display estimate for infinite
+    return introSecs() + (double)cfgCount * loopSecs() + (double)cfg_fade_secs.get();
+}
+
 
 static input_singletrack_factory_t<input_msu> g_input_msu_factory;
 
-// version info
-DECLARE_COMPONENT_VERSION("MSU-1 PCM Player",
-"0.1",
-"MSU-1 audio playback plug-in.\n(c) 2017, qwertymodo")
+DECLARE_COMPONENT_VERSION(
+    "MSU-1 PCM Input",
+    "1.0-fb2k2",
+    "MSU-1 PCM audio playback for foobar2000 v2 x64.\n"
+    "Supports looping, configurable loop count, and fade-out.\n"
+    "Settings: File > Preferences > Advanced > Decoding\n"
+    "Based on foo_input_msu by qwertymodo (2017).\n"
+    "Updated for foobar2000 SDK v2 by Echo-Storm (2026).")
+
 DECLARE_FILE_TYPE("MSU-1 audio files", "*.pcm");
 
-// This will prevent users from renaming your component around (important for proper troubleshooter behaviors) or loading multiple instances of it.
-VALIDATE_COMPONENT_FILENAME("foo_input_msu.dll");
+VALIDATE_COMPONENT_FILENAME("foo_input_msu1.dll");
